@@ -19,7 +19,6 @@ decorator==5.2.1
 defusedxml==0.7.1
 dotenv==0.9.9
 executing==2.2.1
--e git+https://github.com/AbrilVilaltaEscabias/FarmaciolaVerda.git@39b0cf3b9106c878d37fd7754819cc82ba010a73#egg=farmaciola_verda
 fastjsonschema==2.21.2
 fqdn==1.5.1
 greenlet==3.3.2

@@ -11,7 +11,7 @@ from sqlalchemy import pool
 from alembic import context
 
 # Importem Base i engine
-from domain import Base, engine
+from src.server.infrastructure.db import Base, engine
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

@@ -26,7 +26,7 @@ Aquest document descriu el **protocol de comunicació** entre els dos.
 | Format dels missatges | JSON, codificat en UTF-8 |
 | Delimitador | Cada missatge és **una sola línia** acabada en `\n` |
 | Patró | Petició → resposta. Cada petició rep **exactament una** resposta |
-| Clients | El servidor atén **un client a la vegada** |
+| Clients | El servidor atén **diversos clients alhora** (`asyncio`: una *Task* per connexió) |
 
 Com que TCP és un flux de bytes i no de missatges, el `\n` final és el que indica on acaba cada missatge. Per això un missatge **no pot contenir salts de línia reals** (dins del JSON, un salt de línia dins d'un text s'escriu com `\n` escapat, i `json.dumps` ja ho fa sol).
 
@@ -357,7 +357,7 @@ Línia que no és JSON:
 ```
 client/client.py      Menús de terminal. Només coneix el protocol; mai toca la BD.
 common/protocol.py    El "contracte": constants, camps i funcions per construir i llegir missatges.
-server/server.py      Socket: accepta clients, llegeix línies i envia respostes.
+server/server.py      Servidor asyncio (start_server): una corutina per client, llegeix línies i envia respostes.
 server/router.py      Router: identifica la comanda i la delega al servei; converteix errors en respostes.
 server/service_layer/ Casos d'ús (services.py) i Unit of Work (unit_of_work.py).
 server/adapters/      Repositoris i mapping de SQLAlchemy (orm.py).

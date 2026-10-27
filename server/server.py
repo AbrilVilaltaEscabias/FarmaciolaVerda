@@ -1,28 +1,46 @@
-import socket
-import threading
- 
+import asyncio
+
 from common import protocol
 from server import router
 from server.db import Base, engine
 
 from server.adapters import orm
- 
- 
-def handle_client(conn, addr):
-    """Atén un client: llegeix línies, les passa al handler i envia la resposta."""
+
+
+async def handle_client(reader, writer):
+    """Atén un client: llegeix línies, les passa al router i envia la resposta.
+
+    Cada connexió s'executa com una Task pròpia (ho fa asyncio.start_server),
+    així que molts clients poden ser atesos alhora amb un sol fil.
+    """
+    addr = writer.get_extra_info("peername")
     print(f"[+] Client connectat: {addr}")
     try:
-        with conn, conn.makefile("rb") as reader:
-            #
-            for line in reader:                      # una iteració per missatge (fins al \n)
-                response = router.handle(line)     # retorna bytes
-                conn.sendall(response)
+        # readline() espera (sense bloquejar el bucle) fins que arriba un \n.
+        # Retorna b"" quan el client tanca la connexió.
+        while line := await reader.readline():
+            # El router i SQLAlchemy són síncrons (bloquegen mentre esperen la BD).
+            # to_thread els executa en un altre fil perquè no congelin el bucle
+            # d'events i la resta de clients puguin seguir avançant.
+            response = await asyncio.to_thread(router.handle, line)
+            writer.write(response)
+            await writer.drain()  # espera si el buffer d'enviament està ple
+    except ValueError:
+        # Línia més llarga que el límit del lector (64 KiB): no es pot resincronitzar.
+        print(f"[!] Missatge massa llarg de {addr}")
+        writer.write(protocol.build_error(protocol.INVALID_DATA, "Missatge massa llarg"))
     except (ConnectionError, OSError) as e:
         print(f"[!] Connexió perduda amb {addr}: {e}")
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (ConnectionError, OSError):
+            pass  # el client ja havia marxat; no hi ha res més a tancar
     print(f"[-] Client desconnectat: {addr}")
- 
- 
-def main():
+
+
+async def main():
 
     # 1. Enllaçar les classes del domini amb les taules
     orm.start_mappers()
@@ -32,19 +50,20 @@ def main():
 
     # 3. Crear les taules si no existeixen
     Base.metadata.create_all(engine)
- 
-    # 4. Arrencar el socket
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s: # crea un socket TCP sobre IPv4
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # evita "address already in use"
-        s.bind((protocol.HOST, protocol.PORT)) # associa el socket a una adreça i un port
-        s.listen() # el posa en mode escolta, esperant que algú es connecti
-        print(f"Servidor escoltant a {protocol.HOST}:{protocol.PORT}")
- 
-        # 5. Acceptar clients en bucle, un fil per cadascun
-        while True:
-            conn, addr = s.accept() # espera fins que un client es connecta. Quan ho fa, retorna dos valors: conn (un socket nou, exclusiu per parlar amb aquell client) i addr (la seva adreça).
-            handle_client(conn, addr)
- 
- 
+
+    # 4. Arrencar el servidor: crea el socket, fa bind/listen i, per cada nova
+    #    connexió, llança handle_client(reader, writer) com una Task nova.
+    server = await asyncio.start_server(handle_client, protocol.HOST, protocol.PORT)
+    addresses = [s.getsockname() for s in server.sockets]
+    print(f"Servidor escoltant a {addresses}")
+
+    # 5. Servir fins que es cancel·li (Ctrl+C)
+    async with server:
+        await server.serve_forever()
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nServidor aturat")

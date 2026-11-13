@@ -1,8 +1,8 @@
 # Farmaciola Verda
 
-Aplicació client-servidor amb sockets TCP. El **servidor** és l'únic que parla amb la base de dades (SQLAlchemy); el **client** és un programa de terminal que només envia peticions i mostra les respostes.
+Aplicació client-servidor amb sockets TCP **protegits amb TLS i certificats**. El **servidor** és l'únic que parla amb la base de dades (SQLAlchemy); el **client** és un programa de terminal que només envia peticions i mostra les respostes.
 
-Aquest document descriu el **protocol de comunicació** entre els dos.
+Aquest document descriu el **protocol de comunicació** entre els dos, la **capa de seguretat** (autenticació per certificats, clau de sessió i xifratge simètric), com **executar-ho** i com **provar-ho**.
 
 ## Índex
 
@@ -14,6 +14,10 @@ Aquest document descriu el **protocol de comunicació** entre els dos.
 6. [Gestió d'errors](#6-gestió-derrors)
 7. [On és implementat](#7-on-és-implementat)
 8. [Com executar-ho](#8-com-executar-ho)
+9. [Seguretat](#9-seguretat)
+10. [Generació dels certificats](#10-generació-dels-certificats)
+11. [Tests](#11-tests)
+12. [Demostració multi-client](#12-demostració-multi-client)
 
 ---
 
@@ -21,16 +25,16 @@ Aquest document descriu el **protocol de comunicació** entre els dos.
 
 | Aspecte | Valor |
 |---|---|
-| Transport | TCP |
+| Transport | TCP sobre **TLS** amb autenticació mútua per certificats (apartat 9) |
 | Adreça per defecte | `127.0.0.1:5000` (definida a `common/protocol.py`) |
-| Format dels missatges | JSON, codificat en UTF-8 |
-| Delimitador | Cada missatge és **una sola línia** acabada en `\n` |
+| Format dels missatges | JSON, codificat en UTF-8 i **xifrat amb la clau de sessió** abans d'enviar-lo |
+| Delimitador | Cada missatge és **una sola línia** acabada en `\n` (un *token* Fernet en Base64, que no conté salts de línia) |
 | Patró | Petició → resposta. Cada petició rep **exactament una** resposta |
 | Clients | El servidor atén **diversos clients alhora** (`asyncio`: una *Task* per connexió) |
 
 Com que TCP és un flux de bytes i no de missatges, el `\n` final és el que indica on acaba cada missatge. Per això un missatge **no pot contenir salts de línia reals** (dins del JSON, un salt de línia dins d'un text s'escriu com `\n` escapat, i `json.dumps` ja ho fa sol).
 
-> Als exemples d'aquest document els JSON es mostren en diverses línies per facilitar-ne la lectura, però pel socket sempre viatgen en una sola línia.
+> Als exemples d'aquest document els JSON es mostren en diverses línies per facilitar-ne la lectura, però pel socket sempre viatgen en una sola línia **i xifrats**: el JSON que veus aquí és el contingut que el client xifra abans d'enviar i que el servidor desxifra en rebre.
 
 Les peticions són **genèriques**: hi ha cinc comandes (`LIST`, `SHOW`, `CREATE`, `UPDATE`, `DELETE`) i l'entitat sobre la qual s'apliquen s'indica dins de les dades amb el camp `resource`.
 
@@ -288,13 +292,13 @@ Les dates (`created_at`) viatgen en format ISO 8601 (`2026-10-20T09:31:10.557495
 
 ### Estratègia
 
-- **Tota petició rep una resposta**, mai silenci: `OK` o `ERROR`.
+- **Tota petició vàlida rep una resposta**, mai silenci: `OK` o `ERROR`. L'única excepció són els missatges que no es poden desxifrar (clau incorrecta, token manipulat o enviat en clar): el servidor els considera un error d'integritat, **tanca la connexió** i no respon (apartat 9).
 - **Un error no tanca la connexió.** Després d'una resposta d'error, el client pot continuar enviant peticions pel mateix socket.
 - **El servidor no cau** per una petició incorrecta. Tots els errors, previstos o no, es converteixen en una resposta `ERROR`.
 - **Cada error té un codi estable** (`error`) i un text legible (`message`). Els programes han de mirar el codi.
 - **Els errors interns no es detallen al client.** Només es retorna `SERVER_ERROR`; el detall queda al terminal del servidor.
 - **Atomicitat.** Cada petició s'executa dins d'una transacció: si hi ha un error, es desfan tots els canvis d'aquella petició (*rollback*).
-- **Errors de connexió** (servidor aturat, connexió tancada): els gestiona el client, no formen part del protocol. El client els mostra i acaba.
+- **Errors de connexió** (servidor aturat, connexió tancada, certificat rebutjat): els gestiona el client, no formen part del protocol. El client els mostra i acaba.
 
 ### Codis d'error
 
@@ -355,9 +359,12 @@ Línia que no és JSON:
 ## 7. On és implementat
 
 ```
-client/client.py      Menús de terminal. Només coneix el protocol; mai toca la BD.
+client/src/client/client.py
+                      Menús de terminal i connexió segura (TLS + clau de sessió). Només coneix el
+                      protocol; mai toca la BD.
 common/protocol.py    El "contracte": constants, camps i funcions per construir i llegir missatges.
-server/server.py      Servidor asyncio (start_server): una corutina per client, llegeix línies i envia respostes.
+server/server.py      Servidor asyncio (start_server): context TLS, autenticació per certificat,
+                      clau de sessió, i una corutina per client que llegeix línies xifrades.
 server/router.py      Router: identifica la comanda i la delega al servei; converteix errors en respostes.
 server/service_layer/ Casos d'ús (services.py) i Unit of Work (unit_of_work.py).
 server/adapters/      Repositoris i mapping de SQLAlchemy (orm.py).
@@ -367,10 +374,12 @@ server/domain/        Entitats del domini (Python pur, sense SQLAlchemy).
 Recorregut d'una petició:
 
 ```
-client → socket → server.py → router.py → services.py → unit_of_work.py → repositoris → BD
+client → (TLS + Fernet) → server.py → router.py → services.py → unit_of_work.py → repositoris → BD
 ```
 
-La resposta fa el camí invers. Per la xarxa només hi viatgen **diccionaris/JSON**: els models i els repositoris mai surten del servidor.
+La resposta fa el camí invers. Per la xarxa només hi viatgen **diccionaris/JSON xifrats**: els models i els repositoris mai surten del servidor.
+
+La seguretat viu **només** a `server.py` i al client. El router, els serveis, la unit of work i els repositoris no en saben res: reben la línia ja desxifrada i retornen la resposta en clar, que el servidor xifra abans d'enviar-la.
 
 `common/protocol.py` ofereix quatre funcions:
 
@@ -384,19 +393,170 @@ La resposta fa el camí invers. Per la xarxa només hi viatgen **diccionaris/JSO
 ### Fora de l'abast del protocol actual
 
 - Relacions entre elements (wish lists, ingredients d'una recepta, perfil d'usuari): no hi ha comandes per gestionar-les.
-- Inici de sessió (*login*) i permisos.
+- Permisos per usuari o per recurs: tots els clients autenticats (amb certificat vàlid) tenen els mateixos drets.
+- Integritat per capçaleres HTTP (`X-Content-Digest`): no s'aplica, perquè la comunicació no és una API REST. La integritat la garanteix Fernet (HMAC-SHA256 dins de cada token).
 
 ---
 
 ## 8. Com executar-ho
 
-Cal tenir una base de dades configurada al fitxer `.env` (vegeu `server/config.py`) i les dependències instal·lades (`pip install -r requirements.txt`).
-
-Des de la **carpeta arrel** del projecte, en dos terminals:
+Cal tenir una base de dades configurada al fitxer `.env` (vegeu `server/config.py`), les dependències instal·lades i els certificats generats a `certs/` (apartat 10).
 
 ```
-python -m server.server     # primer: engega el servidor i el deixa escoltant
-python -m client.client     # després: obre el client
+python -m venv venv
+venv\Scripts\activate            # a Linux/macOS: source venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-El servidor s'atura amb `Ctrl+C`.
+Exemple de `.env` (**no hi posis credencials reals**):
+
+```
+ENVIRONMENT=development
+DB_URL_DEVELOPMENT=sqlite:///build/FarmaciaVerda.db
+DB_URL_TEST=sqlite:///:memory:
+```
+
+La carpeta `build/` ha d'existir a l'arrel del projecte (SQLite crea el fitxer, però no la carpeta).
+
+Des de la **carpeta arrel** del projecte, en terminals separats:
+
+```
+python -m server.server                          # primer: engega el servidor
+python -m client.src.client.client client1       # un client, amb el certificat de client1
+python -m client.src.client.client client2       # un altre client alhora, amb client2
+```
+
+L'argument és el nom del certificat que fa servir el client (`certs/<nom>/<nom>.crt` i `.key`). Si no se'n dona cap, s'usa `client1`. El servidor s'atura amb `Ctrl+C`.
+
+---
+
+## 9. Seguretat
+
+La seguretat combina **criptografia asimètrica** (per autenticar i per acordar una clau) i **simètrica** (per xifrar les dades). Tot passa abans d'acceptar qualsevol petició de negoci.
+
+### 9.1 Flux d'una connexió
+
+```
+Client                                              Servidor
+  |  1. Connexió TCP + handshake TLS                    |
+  |  -- certificat del client (signat per la CA) -->    |
+  |  <-- certificat del servidor (signat per la CA) --  |  2. Es validen contra ca.crt
+  |                                                     |     (si falla: es tanca la connexió)
+  |                                                     |  3. Es comprova que el certificat
+  |                                                     |     no estigui ja connectat
+  |                                                     |  4. Es genera una clau de sessió (Fernet)
+  |  <-- clau de sessió xifrada amb la clau pública --  |     i es xifra amb la clau pública
+  |      RSA del client (OAEP + SHA-256, Base64)        |     del certificat del client
+  |  5. El client la desxifra amb la seva clau privada  |
+  |  == a partir d'aquí, tot va xifrat amb Fernet ==    |
+  |  -- token Fernet (petició JSON) -->                 |  6. Es desxifra i va al router
+  |  <-- token Fernet (resposta JSON) --                |  7. La resposta es xifra i s'envia
+```
+
+### 9.2 Autenticació amb certificats
+
+- El servidor usa un `SSLContext` amb `verify_mode = CERT_REQUIRED` i `ca.crt` com a única CA de confiança: **un client sense certificat, amb un certificat d'una altra CA o autosignat és rebutjat** durant el handshake i no pot enviar cap petició.
+- El client també valida el certificat del servidor contra la mateixa CA (autenticació **mútua**). El certificat del servidor porta `subjectAltName = DNS:localhost, IP:127.0.0.1`.
+- **Un mateix certificat no pot estar connectat dues vegades alhora**: el servidor guarda l'empremta SHA-256 de cada certificat actiu i tanca la segona connexió. L'empremta s'allibera quan el client es desconnecta.
+- Els certificats de client han de ser **RSA** (la clau de sessió es xifra amb la seva clau pública). Si no ho són, el servidor tanca la connexió.
+
+### 9.3 Clau de sessió i xifratge simètric
+
+- Cada connexió rep una **clau de sessió nova** (`Fernet.generate_key()`), que no es reutilitza mai entre clients ni entre connexions.
+- La clau viatja xifrada amb **RSA-OAEP (SHA-256)** i només la pot llegir el propietari de la clau privada del certificat.
+- Les dades es xifren amb **Fernet** (AES-128-CBC amb HMAC-SHA256). Això dona **confidencialitat** i també **integritat**: un token modificat o xifrat amb una altra clau no es pot desxifrar (`InvalidToken`).
+- Un missatge que no es pot desxifrar (enviat en clar, manipulat o d'una altra sessió) provoca el tancament de la connexió i un avís al log del servidor.
+- El servidor limita la mida d'una línia (64 KiB). Si es supera, respon amb `INVALID_DATA` (xifrat) i tanca la connexió.
+
+> **Sobre `X-Content-Digest`:** la comunicació és sobre sockets i no una API REST, de manera que no cal la capçalera de digest SHA-256 de l'enunciat. La integritat de cada missatge la verifica el HMAC de Fernet.
+
+---
+
+## 10. Generació dels certificats
+
+Els certificats estan a `certs/`:
+
+```
+certs/
+├── ca.crt, ca.key        Autoritat de certificació (ca.key és secreta: no es lliura ni es puja a git)
+├── client.ext            Extensions dels clients (extendedKeyUsage = clientAuth)
+├── servidor/             server.crt, server.key, server.ext (amb el subjectAltName)
+├── client1/              client1.crt, client1.key
+└── client2/              client2.crt, client2.key
+```
+
+Es generen amb OpenSSL (executar-ho a la carpeta `certs/`; **si ja els tens, no ho tornis a fer**, perquè se sobreescriurien):
+
+```bash
+# 1. CA
+openssl genrsa -out ca.key 2048
+openssl req -x509 -new -key ca.key -sha256 -days 365 -out ca.crt -subj "/CN=MiCA"
+
+# 2. Servidor (server.ext conté: subjectAltName=DNS:localhost,IP:127.0.0.1)
+openssl genrsa -out servidor/server.key 2048
+openssl req -new -key servidor/server.key -out servidor/server.csr -subj "/CN=localhost"
+openssl x509 -req -in servidor/server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -out servidor/server.crt -days 365 -sha256 -extfile servidor/server.ext
+
+# 3. Clients (repetir per a client1 i client2; client.ext conté: extendedKeyUsage=clientAuth)
+openssl genrsa -out client1/client1.key 2048
+openssl req -new -key client1/client1.key -out client1/client1.csr -subj "/CN=client1"
+openssl x509 -req -in client1/client1.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -out client1/client1.crt -days 365 -sha256 -extfile client.ext
+```
+
+Comprovació: `openssl verify -CAfile ca.crt servidor/server.crt client1/client1.crt client2/client2.crt` ha de mostrar `OK` tres vegades.
+
+---
+
+## 11. Tests
+
+Des de l'arrel del projecte (els tests carreguen els certificats de `certs/` amb rutes relatives):
+
+```
+python -m pytest -v
+```
+
+| Fitxer | Què prova |
+|---|---|
+| `test_protocol.py` | Construcció i lectura de missatges |
+| `test_validation.py` | Validació de dades |
+| `test_services.py` | Casos d'ús (amb una BD falsa) |
+| `test_unit_of_work.py` | Commit i rollback |
+| `test_router.py` | Comandes, errors i codis de resposta |
+| `test_server.py` | Capa de sockets: bucle de lectura/resposta, gestió d'errors de xarxa, i **diversos clients alhora** sobre un servidor real amb TLS (un client callat no bloqueja els altres; una petició lenta no congela el bucle d'events) |
+| `test_security.py` | **Autenticació** (certificats vàlids acceptats; sense certificat, d'una altra CA, autosignat i duplicat rebutjats), **clau de sessió** (vàlida, diferent a cada connexió, només llegible amb la clau privada correcta) i **xifratge** (peticions en clar, tokens manipulats o d'una altra sessió rebutjats; res en clar pel cable) |
+| `tls_helpers.py` | Utilitats: clients TLS reals i generació de certificats falsos al vol |
+
+Resultat actual: **356 tests passen**. Per mesurar la cobertura:
+
+```
+python -m pytest --cov=server --cov=common --cov-report=term-missing
+```
+
+La capa de seguretat (`handle_client`), el router, els serveis i el protocol tenen cobertura completa. Els tests de seguretat comproven també el cas negatiu: si s'afebleix el servidor (per exemple, `CERT_NONE` en comptes de `CERT_REQUIRED`), fallen.
+
+---
+
+## 12. Demostració multi-client
+
+El servidor atén els clients amb `asyncio`: una *Task* per connexió, i les consultes a la BD s'executen en fils (`asyncio.to_thread`) perquè una petició lenta no bloquegi el bucle d'events.
+
+Per reproduir-ho, a la carpeta arrel i amb quatre terminals:
+
+1. **Terminal 1:** `python -m server.server`
+2. **Terminal 2:** `python -m client.src.client.client client1`
+3. **Terminal 3:** `python -m client.src.client.client client2`
+4. **Terminal 4:** `python -m client.src.client.client client1` (el mateix certificat que el Terminal 2)
+
+Què s'hi ha de veure:
+
+- Al log del servidor: `Client autenticat: CN=client1` i `CN=client2`, tots dos actius a la vegada.
+- Als terminals 2 i 3: `client1` crea una recepta mentre `client2` en filtra o en llista d'altres, sense esperar-se.
+- Al terminal 4: el client és rebutjat (`Connection with the server lost: El servidor ha rebutjat la connexió`) i al log del servidor apareix `certificat ja connectat`.
+
+Proves de rebuig addicionals (automatitzades a `test_security.py`): client sense certificat, amb un certificat d'una altra CA o autosignat.
+
+![Tests](docs/01_tests.png)
+![Cobertura](docs/02_cobertura.png)
+![Demostració multi-client](docs/03_multiclient.png)

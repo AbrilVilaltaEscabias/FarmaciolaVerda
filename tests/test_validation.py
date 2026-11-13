@@ -84,6 +84,7 @@ class TestCommand:
 
 # ------------------------------------------------ camps obligatoris de data
 
+
 class TestMissingDataFields:
     @pytest.mark.parametrize("command, data, field", [
         ("LIST", {}, "resource"),

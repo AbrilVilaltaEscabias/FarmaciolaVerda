@@ -6,11 +6,13 @@ Els casos d’ús de l’aplicació (registrar un usuari, fer una comanda...). C
 import hashlib
 import os
 from datetime import datetime
- 
+from typing import Any
+
 from server.domain import Category, Ingredient, Recipe, User
 from server.domain.exceptions import AlreadyExists, NotFound
+from server.service_layer.unit_of_work import AbstractUnitOfWork
 
- 
+
 #   repo     -> nom de l'atribut del repositori dins l'UoW
 #   model    -> classe del model
 #   fields   -> camps que s'envien al client (mai la password!)
@@ -51,17 +53,17 @@ RESOURCES = {
         "editable": ["user_name", "alias", "email", "phone"],
     },
 }
- 
- 
+
+
 # ---------- Auxiliars ----------
- 
-def _config(resource):
+
+def _config(resource: str) -> dict[str, Any]:
     if resource not in RESOURCES:
         raise ValueError(f"Recurs desconegut: {resource}")
     return RESOURCES[resource]
- 
- 
-def _to_dict(obj, fields):
+
+
+def _to_dict(obj: Any, fields: list[str] | tuple[str, ...]) -> dict[str, Any]:
     result = {}
     for field in fields:
         value = getattr(obj, field)
@@ -69,24 +71,30 @@ def _to_dict(obj, fields):
             value = value.isoformat()
         result[field] = value
     return result
- 
- 
-def _get_or_fail(repo, resource, id):
+
+
+def _get_or_fail(repo: Any, resource: str, id: int) -> Any:
     obj = repo.get(id)
     if obj is None:
         raise NotFound(f"{resource} amb id {id} no existeix")
     return obj
- 
- 
-def _hash_password(password):
+
+
+def _hash_password(password: str) -> str:
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000)
     return salt.hex() + "$" + digest.hex()
- 
- 
+
+
 # ---------- Casos d'ús ----------
- 
-def list_resources(uow, resource, filters=None, page=None, page_size=10):
+
+def list_resources(
+    uow: AbstractUnitOfWork,
+    resource: str,
+    filters: dict | None = None,
+    page: int | None = None,
+    page_size: int = 10,
+) -> list[dict[str, Any]]:
     cfg = _config(resource)
     filters = filters or {}
     with uow:
@@ -100,15 +108,16 @@ def list_resources(uow, resource, filters=None, page=None, page_size=10):
         else:
             objs = repo.get_all()
         return [_to_dict(o, cfg["fields"]) for o in objs]
- 
- 
-def show_resource(uow, resource, id):
+
+
+def show_resource(uow: AbstractUnitOfWork, resource: str, id: int) -> dict[str, Any]:
     cfg = _config(resource)
     with uow:
         obj = _get_or_fail(getattr(uow, cfg["repo"]), resource, id)
         return _to_dict(obj, cfg["fields"])
- 
-def create_resource(uow, resource, values):
+
+
+def create_resource(uow: AbstractUnitOfWork, resource: str, values: dict) -> dict[str, Any]:
     cfg = _config(resource)
     if not isinstance(values, dict):
         raise ValueError("values ha de ser un objecte")
@@ -118,7 +127,7 @@ def create_resource(uow, resource, values):
 
     allowed = set(cfg["editable"]) | set(cfg["required"])
     fields = {k: v for k, v in values.items() if k in allowed}
- 
+
     with uow:
         repo = getattr(uow, cfg["repo"])
         if resource == "user":
@@ -127,14 +136,16 @@ def create_resource(uow, resource, values):
             fields["password"] = _hash_password(fields["password"])
         if "created_at" in cfg["fields"]:
             fields["created_at"] = datetime.now()
- 
+
         obj = cfg["model"](**fields)
         repo.add(obj)
-        uow.session.flush()                 # perquè obj.id ja tingui valor
+        uow.flush()                         # perquè obj.id ja tingui valor
         return _to_dict(obj, cfg["fields"])
- 
- 
-def update_resource(uow, resource, id, values):
+
+
+def update_resource(
+    uow: AbstractUnitOfWork, resource: str, id: int, values: dict
+) -> dict[str, Any]:
     cfg = _config(resource)
     if not isinstance(values, dict):
         raise ValueError("values ha de ser un objecte")
@@ -144,9 +155,9 @@ def update_resource(uow, resource, id, values):
             if field in cfg["editable"]:
                 setattr(obj, field, value)  # el commit del UoW guarda els canvis
         return _to_dict(obj, cfg["fields"])
- 
- 
-def delete_resource(uow, resource, id):
+
+
+def delete_resource(uow: AbstractUnitOfWork, resource: str, id: int) -> None:
     cfg = _config(resource)
     with uow:
         repo = getattr(uow, cfg["repo"])

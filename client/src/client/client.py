@@ -1,10 +1,4 @@
-"""
-Terminal client for Farmaciola Verda.
 
-It only talks to the server through the socket protocol (common/protocol.py)
-and works with plain dictionaries. It never touches the database, the
-domain models or SQLAlchemy.
-"""
 """
 Client de terminal de Farmaciola Verda.
 
@@ -13,13 +7,24 @@ Només parla amb el servidor a través del protocol de sockets
 de dades, els models del domini ni SQLAlchemy.
 """
 import socket
+import ssl
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
+from typing import Any
+
+import base64
 
 from rich.console import Console
 from rich.markup import escape
 from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import hashes
+from cryptography.fernet import Fernet
 
 from common import protocol
 
@@ -27,10 +32,21 @@ ACCENT = "bold medium_orchid"
 HIGHLIGHT = "bold dark_sea_green3"
 ERROR = "bold red"
 
+nom = sys.argv[1] if len(sys.argv) > 1 else "client1"
+
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+try:
+    context.load_cert_chain(certfile=f"certs/{nom}/{nom}.crt",
+                            keyfile=f"certs/{nom}/{nom}.key")
+except FileNotFoundError:
+    print(f"No existeix el certificat per a {nom}")
+    sys.exit(1)
+context.load_verify_locations(cafile="certs/ca.crt")
 
 # ·························································
 # · CONNEXIÓ AMB EL SERVIDOR                             ·
 # ·························································
+
 
 class ServerError(Exception):
     """El servidor ha respost amb un ERROR."""
@@ -39,58 +55,115 @@ class ServerError(Exception):
 class ServerConnection:
     """Envia peticions al servidor i retorna les dades de la resposta."""
 
-    def __init__(self, host=protocol.HOST, port=protocol.PORT):
-        self._socket = socket.create_connection((host, port))
+    def __init__(
+        self,
+        host: str = protocol.HOST,
+        port: int = protocol.PORT,
+        context: ssl.SSLContext = context,
+    ) -> None:
+        sock = socket.create_connection((host, port))  # socket normal, SENSE xifrar
+        self._socket = context.wrap_socket(
+            sock,
+            server_hostname="localhost"
+        )
         self._reader = self._socket.makefile("rb")
 
-    def __enter__(self):
+        # Rebre la clau AES xifrada del servidor
+        encrypted_key = self._reader.readline()
+
+        if not encrypted_key:
+            raise ConnectionError(
+                "El servidor ha rebutjat la connexió o l'ha tancat."
+            )
+
+        # Descodificar el missatge Base64
+        encrypted_key = base64.b64decode(encrypted_key.strip())
+
+        # Carregar la clau privada del client
+        with open(f"certs/{nom}/{nom}.key", "rb") as f:
+            private_key = serialization.load_pem_private_key(
+                f.read(),
+                password=None
+            )
+
+        # Desxifrar la clau AES
+        self.session_key = private_key.decrypt(
+            encrypted_key.strip(),
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+
+        # Crear el xifrador AES
+        self.cipher = Fernet(self.session_key)
+
+    def __enter__(self) -> "ServerConnection":
         return self
 
-    def __exit__(self, exc_type, exc, traceback):
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self.close()
 
-    def close(self):
+    def close(self) -> None:
         self._reader.close()
         self._socket.close()
 
-    def request(self, command, data=None):
-        self._socket.sendall(protocol.build_request(command, data))
-        line = self._reader.readline()
-        if not line:
+    def request(self, command: str, data: dict | None = None) -> dict:
+        # Construir la petició en format protocol
+        request = protocol.build_request(command, data)
+
+        # Xifrar la petició amb la clau AES de la sessió
+        encrypted_request = self.cipher.encrypt(request)
+
+        # Enviar la petició xifrada
+        self._socket.sendall(encrypted_request + b"\n")
+
+        # Rebre la resposta xifrada
+        encrypted_response = self._reader.readline()
+
+        if not encrypted_response:
             raise ConnectionError("The server closed the connection")
-        response = protocol.parse_message(line)
+
+        # Desxifrar la resposta
+        response_line = self.cipher.decrypt(encrypted_response.strip())
+
+        # Interpretar la resposta del protocol
+        response = protocol.parse_message(response_line)
+
         if response[protocol.FIELD_STATUS] != protocol.OK:
             error = response.get(protocol.FIELD_ERROR)
             message = response.get(protocol.FIELD_MESSAGE)
             raise ServerError(message or error)
+
         return response[protocol.FIELD_DATA]
 
-    def list_items(self, resource, filters=None):
+    def list_items(self, resource: str, filters: dict | None = None) -> list[dict]:
         data = {protocol.FIELD_RESOURCE: resource}
         if filters:
             data[protocol.FIELD_FILTER] = filters
         return self.request(protocol.LIST, data)["items"]
 
-    def show(self, resource, item_id):
+    def show(self, resource: str, item_id: int) -> dict:
         return self.request(protocol.SHOW, {
             protocol.FIELD_RESOURCE: resource,
             protocol.FIELD_ID: item_id,
         })
 
-    def create(self, resource, values):
+    def create(self, resource: str, values: dict) -> dict:
         return self.request(protocol.CREATE, {
             protocol.FIELD_RESOURCE: resource,
             protocol.FIELD_VALUES: values,
         })
 
-    def update(self, resource, item_id, values):
+    def update(self, resource: str, item_id: int, values: dict) -> dict:
         return self.request(protocol.UPDATE, {
             protocol.FIELD_RESOURCE: resource,
             protocol.FIELD_ID: item_id,
             protocol.FIELD_VALUES: values,
         })
 
-    def delete(self, resource, item_id):
+    def delete(self, resource: str, item_id: int) -> None:
         self.request(protocol.DELETE, {
             protocol.FIELD_RESOURCE: resource,
             protocol.FIELD_ID: item_id,
@@ -202,7 +275,7 @@ USER = Resource(
 # · FUNCIONS D'ENTRADA I SORTIDA                         ·
 # ·························································
 
-def show_title(console):
+def show_title(console: Console) -> None:
     print()
     console.print("""[bold medium_orchid] \\    / _  |  _  _  ._ _   _    _|_  _
   \\/\\/ (/_ | (_ (_) | | | (/_    |_ (_) [/bold medium_orchid][bold dark_sea_green3]
@@ -213,12 +286,12 @@ def show_title(console):
 [/bold dark_sea_green3]""")  # noqa: E501
 
 
-def format_value(value):
+def format_value(value: object) -> str:
     """Text que es mostra per a un valor que ve del servidor."""
     return "-" if value is None else escape(str(value))
 
 
-def select_option(console, max_option, min_option=0):
+def select_option(console: Console, max_option: int, min_option: int = 0) -> int:
     while True:
         option = IntPrompt.ask(f"[{ACCENT}]Select an option[/]")
         if min_option <= option <= max_option:
@@ -229,11 +302,11 @@ def select_option(console, max_option, min_option=0):
         )
 
 
-def ask_id(question):
+def ask_id(question: str) -> int:
     return IntPrompt.ask(f"[{HIGHLIGHT}]{question}[/]")
 
 
-def ask_field_value(console, field):
+def ask_field_value(console: Console, field: Field) -> Any:
     """Demana un camp fins que el valor és vàlid. None si es deixa buit."""
     label = field.label if field.required else f"{field.label} (optional)"
     while True:
@@ -251,12 +324,14 @@ def ask_field_value(console, field):
             console.print(f"[{ERROR}]The value is invalid.[/]")
 
 
-def ask_values(console, fields):
+def ask_values(console: Console, fields: tuple[Field, ...]) -> dict[str, Any]:
     values = {field.name: ask_field_value(console, field) for field in fields}
     return {name: value for name, value in values.items() if value is not None}
 
 
-def print_table(console, title, columns, items):
+def print_table(
+    console: Console, title: str, columns: tuple, items: list[dict]
+) -> None:
     table = Table(title=title, header_style=ACCENT)
     for index, (_, header) in enumerate(columns):
         table.add_column(
@@ -269,7 +344,7 @@ def print_table(console, title, columns, items):
     console.print(table)
 
 
-def print_detail(console, title, item, rows):
+def print_detail(console: Console, title: object, item: dict, rows: tuple) -> None:
     table = Table(title=escape(str(title)), show_header=False)
     table.add_column("field", style=ACCENT)
     table.add_column("value")
@@ -282,20 +357,26 @@ def print_detail(console, title, item, rows):
 # · ACCIONS GENÈRIQUES (iguals per a tots els recursos)  ·
 # ·························································
 
-def show_all(console, api, resource):
+def show_all(
+    console: Console, api: ServerConnection, resource: Resource
+) -> None:
     items = api.list_items(resource.name)
     print_table(console, resource.label.capitalize() + "s",
                 resource.list_columns, items)
 
 
-def show_one(console, api, resource):
+def show_one(
+    console: Console, api: ServerConnection, resource: Resource
+) -> None:
     item_id = ask_id(f"Enter the id of the {resource.label} to show: ")
     item = api.show(resource.name, item_id)
     print_detail(console, item[resource.title_field], item,
                  resource.detail_rows)
 
 
-def create_one(console, api, resource):
+def create_one(
+    console: Console, api: ServerConnection, resource: Resource
+) -> None:
     console.print(f"[{ACCENT}]Add a new {resource.label}[/]")
     values = ask_values(console, resource.form_fields)
     item = api.create(resource.name, values)
@@ -306,7 +387,9 @@ def create_one(console, api, resource):
     )
 
 
-def update_one(console, api, resource):
+def update_one(
+    console: Console, api: ServerConnection, resource: Resource
+) -> None:
     item_id = ask_id(f"Enter the id of the {resource.label} to update: ")
     fields = resource.form_fields
 
@@ -323,13 +406,15 @@ def update_one(console, api, resource):
     console.print(f"[{HIGHLIGHT}]Field '{field.name}' updated.[/]")
 
 
-def delete_one(console, api, resource):
+def delete_one(
+    console: Console, api: ServerConnection, resource: Resource
+) -> None:
     item_id = ask_id(f"Enter the id of the {resource.label} to delete: ")
     api.delete(resource.name, item_id)
     console.print(f"[{HIGHLIGHT}]{resource.label.capitalize()} deleted.[/]")
 
 
-def filter_recipes(console, api):
+def filter_recipes(console: Console, api: ServerConnection) -> None:
     console.print(f"[{ACCENT}]Filter recipes[/]")
     console.print(f"[{HIGHLIGHT}]1.[/] By name")
     console.print(f"[{HIGHLIGHT}]2.[/] By category")
@@ -354,7 +439,7 @@ def filter_recipes(console, api):
 # · MENÚS                                                ·
 # ·························································
 
-def show_menu(console, title, options):
+def show_menu(console: Console, title: str, options: dict[str, str]) -> int:
     table = Table(title=title, header_style=ACCENT)
     table.add_column("Option", justify="center", style=HIGHLIGHT)
     table.add_column("Title", justify="left", width=75)
@@ -367,7 +452,12 @@ def show_menu(console, title, options):
     return select_option(console, len(options))
 
 
-def run_menu(console, api, title, entries):
+def run_menu(
+    console: Console,
+    api: ServerConnection,
+    title: str,
+    entries: list[tuple[str, str, Callable[..., None]]],
+) -> bool:
     """Mostra un menú i executa l'acció triada.
 
     entries és una llista de (nom, descripció, acció). Retorna False quan
@@ -386,7 +476,7 @@ def run_menu(console, api, title, entries):
     return True
 
 
-def recipes_menu(console, api):
+def recipes_menu(console: Console, api: ServerConnection) -> None:
     run_menu(console, api, "Recipes CRUD", [
         ("Show All", "See all the medicinal recipes",
          partial(show_all, resource=RECIPE)),
@@ -399,7 +489,7 @@ def recipes_menu(console, api):
     ])
 
 
-def plants_menu(console, api):
+def plants_menu(console: Console, api: ServerConnection) -> None:
     run_menu(console, api, "Medicinal plants CRUD", [
         ("Show All", "See all the medicinal plants",
          partial(show_all, resource=PLANT)),
@@ -411,7 +501,7 @@ def plants_menu(console, api):
     ])
 
 
-def users_menu(console, api):
+def users_menu(console: Console, api: ServerConnection) -> None:
     run_menu(console, api, "Users", [
         ("Add", "Register a new user", partial(create_one, resource=USER)),
         ("Delete", "Delete a user", partial(delete_one, resource=USER)),
@@ -426,7 +516,7 @@ MAIN_MENU = [
 ]
 
 
-def main():
+def main() -> None:
     console = Console()
     show_title(console)
     try:

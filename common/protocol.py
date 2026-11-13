@@ -9,7 +9,7 @@ import json
 
 HOST = "127.0.0.1"
 PORT = 5000
-SEPARATOR = "\n" # Cada missatge acaba amb /n (ENTER)
+SEPARATOR = "\n"  # Cada missatge acaba amb /n (ENTER)
 
 # --- COMANDES (client -> servidor) -----------------------------------------
 
@@ -51,23 +51,25 @@ FIELD_STATUS = "status"
 FIELD_ERROR = "error"
 FIELD_MESSAGE = "message"
 
-def build_request(command, data=None):
+
+def build_request(command: str, data: dict | None = None) -> bytes:
     """Client: construeix la petició a enviar."""
     message = {FIELD_COMMAND: command, FIELD_DATA: data or {}}
     return (json.dumps(message) + SEPARATOR).encode()
 
-def build_ok(data=None):
+
+def build_ok(data: dict | None = None) -> bytes:
     """Servidor: resposta d'èxit."""
     message = {FIELD_STATUS: OK, FIELD_DATA: data or {}}
     return (json.dumps(message) + SEPARATOR).encode()
 
 
-def build_error(error, message=""):
+def build_error(error: str, message: str = "") -> bytes:
     """Servidor: resposta d'error."""
     msg = {FIELD_STATUS: ERROR, FIELD_ERROR: error, FIELD_MESSAGE: message}
     return (json.dumps(msg) + SEPARATOR).encode()
 
 
-def parse_message(line):
+def parse_message(line: bytes) -> dict:
     """Tots dos: converteix una línia rebuda en diccionari."""
     return json.loads(line.decode().strip())

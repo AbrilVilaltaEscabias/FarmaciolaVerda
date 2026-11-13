@@ -7,5 +7,6 @@ Session = sessionmaker(bind=engine)
 
 print("DB_URL:", DB_URL)
 
+
 class Base(DeclarativeBase):
     ...

@@ -4,50 +4,53 @@
 """
 
 import json
- 
+from collections.abc import Callable
+
 from common import protocol
-from server.db import Session
 from server.domain.exceptions import AlreadyExists, NotFound
 from server.service_layer import services, unit_of_work
- 
- 
-def _new_uow():
+
+
+def _new_uow() -> unit_of_work.AbstractUnitOfWork:
     # Un UoW nou per cada petició: les sessions no es comparteixen entre fils.
-   return unit_of_work.SqlAlchemyUnitOfWork()
+    return unit_of_work.SqlAlchemyUnitOfWork()
+
 
 # --- HANDLERS -----------------------------------------------------------------
 """ Tots segueixen la mateixa idea: reben data (un diccionari), crida un servei
 i retornen una resposta en bytes. """
 
-def handle_list(data):
+
+def handle_list(data: dict) -> bytes:
     items = services.list_resources(
         _new_uow(),
-        data[protocol.FIELD_RESOURCE], # El tipus d'objecte (recipe, ingredient...)
-        data.get(protocol.FIELD_FILTER), # (Opcional)
-        data.get(protocol.FIELD_PAGE),  # (Opcional) 
+        data[protocol.FIELD_RESOURCE],  # El tipus d'objecte (recipe, ingredient...)
+        data.get(protocol.FIELD_FILTER),  # (Opcional)
+        data.get(protocol.FIELD_PAGE),  # (Opcional)
         data.get(protocol.FIELD_PAGE_SIZE, 10)  # (Opcional)
     )
-    return protocol.build_ok({"items": items}) # Retorna la llista d'items
- 
- 
-def handle_show(data):
+    return protocol.build_ok({"items": items})  # Retorna la llista d'items
+
+
+def handle_show(data: dict) -> bytes:
     item = services.show_resource(
-        _new_uow(), 
-        data[protocol.FIELD_RESOURCE], 
+        _new_uow(),
+        data[protocol.FIELD_RESOURCE],
         data[protocol.FIELD_ID]
     )
-    return protocol.build_ok(item) # Retorna l'item
+    return protocol.build_ok(item)  # Retorna l'item
 
-def handle_create(data):
+
+def handle_create(data: dict) -> bytes:
     item = services.create_resource(
-        _new_uow(), 
-        data[protocol.FIELD_RESOURCE], 
-        data[protocol.FIELD_VALUES] # objecte json amb les dades
+        _new_uow(),
+        data[protocol.FIELD_RESOURCE],
+        data[protocol.FIELD_VALUES]  # objecte json amb les dades
     )
-    return protocol.build_ok(item) # Retorna l'item creat
- 
- 
-def handle_update(data):
+    return protocol.build_ok(item)  # Retorna l'item creat
+
+
+def handle_update(data: dict) -> bytes:
     item = services.update_resource(
         _new_uow(),
         data[protocol.FIELD_RESOURCE],
@@ -55,30 +58,30 @@ def handle_update(data):
         data[protocol.FIELD_VALUES],
     )
     return protocol.build_ok(item)  # Retorna l'item actualitzat
- 
- 
-def handle_delete(data):
+
+
+def handle_delete(data: dict) -> bytes:
     services.delete_resource(
         _new_uow(), data[protocol.FIELD_RESOURCE], data[protocol.FIELD_ID]
     )
     return protocol.build_ok()
- 
- 
+
+
 # ---------- Taula: comanda -> handler ----------
- 
-COMMANDS = {
+
+COMMANDS: dict[str, Callable[[dict], bytes]] = {
     protocol.LIST: handle_list,
     protocol.SHOW: handle_show,
     protocol.CREATE: handle_create,
     protocol.UPDATE: handle_update,
     protocol.DELETE: handle_delete,
 }
- 
- 
+
+
 # ---------- Punt d'entrada (el crida server.py) ----------
- 
-def handle(line):
-    
+
+def handle(line: bytes) -> bytes:
+
     # 1. Interpretar el missatge
     try:
         request = protocol.parse_message(line)
@@ -95,7 +98,7 @@ def handle(line):
     func = COMMANDS.get(command)
     if func is None:
         return protocol.build_error(protocol.UNKNOWN_COMMAND, f"Comanda desconeguda: {command}")
- 
+
     # 3. Executar-lo i convertir errors en respostes del protocol
     try:
         return func(data)
@@ -110,4 +113,3 @@ def handle(line):
     except Exception as e:
         print(f"[!] Error inesperat a {command}: {e!r}")
         return protocol.build_error(protocol.SERVER_ERROR, "Error intern del servidor")
- 

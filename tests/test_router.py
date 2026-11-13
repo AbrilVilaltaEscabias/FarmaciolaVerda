@@ -47,7 +47,8 @@ class TestCommandTable:
 class TestHandle:
     def test_returns_bytes(self, services_mock):
         services_mock.list_resources.return_value = []
-        assert isinstance(router.handle(b'{"command":"LIST","data":{"resource":"recipe"}}\n'), bytes)
+        assert isinstance(router.handle(
+            b'{"command":"LIST","data":{"resource":"recipe"}}\n'), bytes)
 
     def test_dispatches_to_the_right_handler(self, services_mock, monkeypatch):
         fake = MagicMock(return_value=protocol.build_ok({"x": 1}))
